@@ -38,6 +38,8 @@ type driver struct {
 	confDir    string
 	nameserver string
 	client     *docker.Client
+	weaveIP    string
+	weaveDNSIP string
 }
 
 func New(version string, nameserver string, confDir string) (Driver, error) {
@@ -51,12 +53,25 @@ func New(version string, nameserver string, confDir string) (Driver, error) {
 		return nil, fmt.Errorf(`could not parse nameserver IP "%s"`, nameserver)
 	}
 
-	return &driver{
+	d := &driver{
 		version:    version,
 		nameserver: nameserver,
 		client:     client,
 		confDir:    confDir,
-	}, nil
+	}
+
+	weaveIP, err := d.getContainerBridgeIP(WeaveContainer)
+	if err != nil {
+		return nil, err
+	}
+	weaveDNSIP, err := d.getContainerBridgeIP(WeaveDNSContainer)
+	if err != nil {
+		return nil, err
+	}
+
+	d.weaveIP = weaveIP
+	d.weaveDNSIP = weaveDNSIP
+	return d, nil
 }
 
 func (driver *driver) Listen(socket string) error {
@@ -426,13 +441,11 @@ func (driver *driver) resolvConfPath() string {
 }
 
 func (driver *driver) ipamOp(ID string, op string) (*net.IPNet, error) {
-	weaveip, err := driver.getContainerBridgeIP(WeaveContainer)
-	if err != nil {
-		return nil, err
-	}
-
-	var res *http.Response
-	url := fmt.Sprintf("http://%s:6784/ip/%s", weaveip, ID)
+	var (
+		res *http.Response
+		err error
+	)
+	url := fmt.Sprintf("http://%s:6784/ip/%s", driver.weaveIP, ID)
 	if op == "POST" {
 		res, err = http.Post(url, "", nil)
 	} else if op == "GET" {
@@ -457,11 +470,7 @@ func (driver *driver) ipamOp(ID string, op string) (*net.IPNet, error) {
 }
 
 func (driver *driver) releaseIP(ID string) error {
-	weaveip, err := driver.getContainerBridgeIP(WeaveContainer)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s:6784/ip/%s", weaveip, ID), nil)
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s:6784/ip/%s", driver.weaveIP, ID), nil)
 	if err != nil {
 		return err
 	}
@@ -485,14 +494,10 @@ func makeMac(ip net.IP) string {
 }
 
 func (driver *driver) registerWithDNS(endpointID string, fqdn string, ip *net.IPNet) error {
-	dnsip, err := driver.getContainerBridgeIP(WeaveDNSContainer)
-	if err != nil {
-		return fmt.Errorf("nameserver not available: %s", err)
-	}
 	data := url.Values{}
 	data.Add("fqdn", fqdn)
 
-	req, err := http.NewRequest("PUT", fmt.Sprintf("http://%s:6785/name/%s/%s", dnsip, endpointID, ip.IP.String()), strings.NewReader(data.Encode()))
+	req, err := http.NewRequest("PUT", fmt.Sprintf("http://%s:6785/name/%s/%s", driver.weaveDNSIP, endpointID, ip.IP.String()), strings.NewReader(data.Encode()))
 	if err != nil {
 		return err
 	}
@@ -510,17 +515,12 @@ func (driver *driver) registerWithDNS(endpointID string, fqdn string, ip *net.IP
 }
 
 func (driver *driver) deregisterWithDNS(endpointID string) error {
-	dnsip, err := driver.getContainerBridgeIP(WeaveDNSContainer)
-	if err != nil {
-		return fmt.Errorf("nameserver not available: %s", err)
-	}
-
 	ip, err := driver.ipamOp(endpointID, "GET")
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s:6785/name/%s/%s", dnsip, endpointID, ip.IP.String()), nil)
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s:6785/name/%s/%s", driver.weaveDNSIP, endpointID, ip.IP.String()), nil)
 	if err != nil {
 		return err
 	}
